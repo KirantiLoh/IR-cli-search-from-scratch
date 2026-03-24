@@ -7,8 +7,9 @@ import math
 
 from index import InvertedIndexReader, InvertedIndexWriter
 from util import IdMap, sorted_merge_posts_and_tfs
-from compression import StandardPostings, VBEPostings
+from compression import EliasGammaPostings, StandardPostings, VBEPostings
 from tqdm import tqdm
+
 
 class BSBIIndex:
     """
@@ -23,7 +24,8 @@ class BSBIIndex:
                     VBEPostings, dsb.
     index_name(str): Nama dari file yang berisi inverted index
     """
-    def __init__(self, data_dir, output_dir, postings_encoding, index_name = "main_index"):
+
+    def __init__(self, data_dir, output_dir, postings_encoding, index_name="main_index"):
         self.term_id_map = IdMap()
         self.doc_id_map = IdMap()
         self.data_dir = data_dir
@@ -87,9 +89,10 @@ class BSBIIndex:
         td_pairs = []
         for filename in next(os.walk(dir))[2]:
             docname = dir + "/" + filename
-            with open(docname, "r", encoding = "utf8", errors = "surrogateescape") as f:
+            with open(docname, "r", encoding="utf8", errors="surrogateescape") as f:
                 for token in f.read().split():
-                    td_pairs.append((self.term_id_map[token], self.doc_id_map[docname]))
+                    td_pairs.append(
+                        (self.term_id_map[token], self.doc_id_map[docname]))
 
         return td_pairs
 
@@ -151,11 +154,11 @@ class BSBIIndex:
             semua intermediate InvertedIndexWriter objects.
         """
         # kode berikut mengasumsikan minimal ada 1 term
-        merged_iter = heapq.merge(*indices, key = lambda x: x[0])
-        curr, postings, tf_list = next(merged_iter) # first item
-        for t, postings_, tf_list_ in merged_iter: # from the second item
+        merged_iter = heapq.merge(*indices, key=lambda x: x[0])
+        curr, postings, tf_list = next(merged_iter)  # first item
+        for t, postings_, tf_list_ in merged_iter:  # from the second item
             if t == curr:
-                zip_p_tf = sorted_merge_posts_and_tfs(list(zip(postings, tf_list)), \
+                zip_p_tf = sorted_merge_posts_and_tfs(list(zip(postings, tf_list)),
                                                       list(zip(postings_, tf_list_)))
                 postings = [doc_id for (doc_id, _) in zip_p_tf]
                 tf_list = [tf for (_, tf) in zip_p_tf]
@@ -164,7 +167,7 @@ class BSBIIndex:
                 curr, postings, tf_list = t, postings_, tf_list_
         merged_index.append(curr, postings, tf_list)
 
-    def retrieve_tfidf(self, query, k = 10):
+    def retrieve_tfidf(self, query, k=10):
         """
         Melakukan Ranked Retrieval dengan skema TaaT (Term-at-a-Time).
         Method akan mengembalikan top-K retrieval results.
@@ -217,11 +220,74 @@ class BSBIIndex:
                         if doc_id not in scores:
                             scores[doc_id] = 0
                         if tf > 0:
-                            scores[doc_id] += math.log(N / df) * (1 + math.log(tf))
+                            scores[doc_id] += math.log(N / df) * \
+                                (1 + math.log(tf))
 
             # Top-K
-            docs = [(score, self.doc_id_map[doc_id]) for (doc_id, score) in scores.items()]
-            return sorted(docs, key = lambda x: x[0], reverse = True)[:k]
+            docs = [(score, self.doc_id_map[doc_id])
+                    for (doc_id, score) in scores.items()]
+            return sorted(docs, key=lambda x: x[0], reverse=True)[:k]
+
+    def retrieve_bm25(self, query, k=10, k1=1.5, b=0.75):
+        """
+        Melakukan Ranked Retrieval dengan skema TaaT (Term-at-a-Time).
+        Method akan mengembalikan top-K retrieval results.
+
+        Score = untuk setiap term di query, akumulasikan IDF * ((tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (dl / avgdl))))
+
+        catatan: 
+            1. informasi DF(t) ada di dictionary postings_dict pada merged index
+            2. informasi TF(t, D) ada di tf_li
+            3. informasi N bisa didapat dari doc_length pada merged index, len(doc_length)
+            4. informasi dl bisa didapat dari doc_length pada merged index, doc_length[doc_id]
+            5. informasi avgdl bisa didapat dari doc_length pada merged index, sum(doc_length.values()) / len(doc_length)
+
+        Parameters
+        ----------
+        query: str
+            Query tokens yang dipisahkan oleh spasi
+
+            contoh: Query "universitas indonesia depok" artinya ada
+            tiga terms: universitas, indonesia, dan depok
+
+        Result
+        ------
+        List[(int, str)]
+            List of tuple: elemen pertama adalah score similarity, dan yang
+            kedua adalah nama dokumen.
+            Daftar Top-K dokumen terurut mengecil BERDASARKAN SKOR.
+        JANGAN LEMPAR ERROR/EXCEPTION untuk terms yang TIDAK ADA di collection.
+        """
+        if len(self.term_id_map) == 0 or len(self.doc_id_map) == 0:
+            self.load()
+
+        terms = [self.term_id_map[word] for word in query.split()]
+        with InvertedIndexReader(self.index_name, self.postings_encoding, directory=self.output_dir) as merged_index:
+
+            scores = {}
+            avgdl = sum(merged_index.doc_length.values()) / \
+                len(merged_index.doc_length)
+            for term in terms:
+                if term in merged_index.postings_dict:
+                    df = merged_index.postings_dict[term][1]
+                    N = len(merged_index.doc_length)
+                    postings, tf_list = merged_index.get_postings_list(term)
+                    for i in range(len(postings)):
+                        doc_id, tf = postings[i], tf_list[i]
+                        dl = merged_index.doc_length[doc_id]
+                        if doc_id not in scores:
+                            scores[doc_id] = 0
+                        if tf > 0:
+                            idf = math.log(N / df)
+                            score = idf * \
+                                ((tf * (k1 + 1)) /
+                                 (tf + k1 * (1 - b + b * (dl / avgdl))))
+                            scores[doc_id] += score
+
+            # Top-K
+            docs = [(score, self.doc_id_map[doc_id])
+                    for (doc_id, score) in scores.items()]
+            return sorted(docs, key=lambda x: x[0], reverse=True)[:k]
 
     def index(self):
         """
@@ -238,22 +304,22 @@ class BSBIIndex:
             td_pairs = self.parse_block(block_dir_relative)
             index_id = 'intermediate_index_'+block_dir_relative
             self.intermediate_indices.append(index_id)
-            with InvertedIndexWriter(index_id, self.postings_encoding, directory = self.output_dir) as index:
+            with InvertedIndexWriter(index_id, self.postings_encoding, directory=self.output_dir) as index:
                 self.invert_write(td_pairs, index)
                 td_pairs = None
-    
+
         self.save()
 
-        with InvertedIndexWriter(self.index_name, self.postings_encoding, directory = self.output_dir) as merged_index:
+        with InvertedIndexWriter(self.index_name, self.postings_encoding, directory=self.output_dir) as merged_index:
             with contextlib.ExitStack() as stack:
                 indices = [stack.enter_context(InvertedIndexReader(index_id, self.postings_encoding, directory=self.output_dir))
-                               for index_id in self.intermediate_indices]
+                           for index_id in self.intermediate_indices]
                 self.merge(indices, merged_index)
 
 
 if __name__ == "__main__":
 
-    BSBI_instance = BSBIIndex(data_dir = 'collection', \
-                              postings_encoding = VBEPostings, \
-                              output_dir = 'index')
-    BSBI_instance.index() # memulai indexing!
+    BSBI_instance = BSBIIndex(data_dir='collection',
+                              postings_encoding=EliasGammaPostings,
+                              output_dir='index')
+    BSBI_instance.index()  # memulai indexing!
