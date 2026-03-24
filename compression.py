@@ -244,6 +244,7 @@ class VBEPostings:
 class EliasGammaPostings:
     @staticmethod
     def eg_encode_number(number):
+        number += 1  # Shift to make it 1-based
         if number < 1:
             raise ValueError("Elias Gamma only supports positive integers")
 
@@ -252,8 +253,6 @@ class EliasGammaPostings:
 
         # Create bitarray with explicit big-endian bit order
         ba = bitarray(endian='big')
-        ba.frombytes(bytes([0]))  # Initialize
-        ba.clear()
 
         # Append bits in order: N zeros, then 1, then N offset bits
         for _ in range(N):
@@ -310,7 +309,7 @@ class EliasGammaPostings:
 
         # 4. Reconstruct number
         number = (1 << N) | offset
-        return number, pos
+        return number - 1, pos
 
     @staticmethod
     def encode(postings_list):
@@ -331,7 +330,7 @@ class EliasGammaPostings:
 
 if __name__ == '__main__':
 
-    postings_list = [34, 67, 89, 454, 2345738]
+    postings_list = [34, 34, 67, 89, 454, 2345738]
     tf_list = [12, 10, 3, 4, 1]
     for Postings in [StandardPostings, VBEPostings, EliasGammaPostings]:
         print(Postings.__name__)
