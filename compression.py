@@ -241,11 +241,99 @@ class VBEPostings:
         return VBEPostings.vb_decode(encoded_tf_list)
 
 
+class EliasGammaPostings:
+    @staticmethod
+    def eg_encode_number(number):
+        if number < 1:
+            raise ValueError("Elias Gamma only supports positive integers")
+
+        N = number.bit_length() - 1
+        offset = number ^ (1 << N)
+
+        # Create bitarray with explicit big-endian bit order
+        ba = bitarray(endian='big')
+        ba.frombytes(bytes([0]))  # Initialize
+        ba.clear()
+
+        # Append bits in order: N zeros, then 1, then N offset bits
+        for _ in range(N):
+            ba.append(0)
+        ba.append(1)
+        for i in range(N - 1, -1, -1):  # MSB first
+            ba.append((offset >> i) & 1)
+
+        return ba
+
+    @staticmethod
+    def eg_encode(list_of_numbers):
+        stream = bitarray(endian='big')
+        for number in list_of_numbers:
+            stream.extend(EliasGammaPostings.eg_encode_number(number))
+        return stream.tobytes()
+
+    @staticmethod
+    def eg_decode(data):
+        stream = bitarray(endian='big')
+        stream.frombytes(data)
+
+        results = []
+        pos = 0
+        while pos < len(stream):
+            try:
+                num, pos = EliasGammaPostings.eg_decode_number(stream, pos)
+                results.append(num)
+            except ValueError:
+                break
+        return results
+
+    @staticmethod
+    def eg_decode_number(stream, pos=0):
+        # 1. Count leading zeros to find N
+        N = 0
+        while pos < len(stream) and stream[pos] == 0:
+            N += 1
+            pos += 1
+
+        # 2. Check separator '1'
+        if pos >= len(stream) or stream[pos] != 1:
+            raise ValueError(
+                f"Invalid Elias Gamma encoding at pos {pos}: expected 1, got {stream[pos] if pos < len(stream) else 'EOF'}")
+        pos += 1
+
+        # 3. Read N bits for offset
+        offset = 0
+        for _ in range(N):
+            if pos >= len(stream):
+                raise ValueError("Unexpected end of stream")
+            offset = (offset << 1) | stream[pos]
+            pos += 1
+
+        # 4. Reconstruct number
+        number = (1 << N) | offset
+        return number, pos
+
+    @staticmethod
+    def encode(postings_list):
+        return EliasGammaPostings.eg_encode(postings_list)
+
+    @staticmethod
+    def decode(encoded_postings_list):
+        return EliasGammaPostings.eg_decode(encoded_postings_list)
+
+    @staticmethod
+    def encode_tf(tf_list):
+        return EliasGammaPostings.eg_encode(tf_list)
+
+    @staticmethod
+    def decode_tf(encoded_tf_list):
+        return EliasGammaPostings.eg_decode(encoded_tf_list)
+
+
 if __name__ == '__main__':
 
     postings_list = [34, 67, 89, 454, 2345738]
     tf_list = [12, 10, 3, 4, 1]
-    for Postings in [StandardPostings, VBEPostings]:
+    for Postings in [StandardPostings, VBEPostings, EliasGammaPostings]:
         print(Postings.__name__)
         encoded_postings_list = Postings.encode(postings_list)
         encoded_tf_list = Postings.encode_tf(tf_list)
