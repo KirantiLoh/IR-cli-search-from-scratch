@@ -6,7 +6,7 @@ import time
 import math
 
 from index import InvertedIndexReader, InvertedIndexWriter
-from util import IdMap, sorted_merge_posts_and_tfs
+from util import IdMap, sorted_merge_posts_and_tfs, compute_max_impact_tfidf, compute_max_impact_bm25, compute_single_term_score
 from compression import EliasGammaPostings, StandardPostings, VBEPostings
 from tqdm import tqdm
 
@@ -25,12 +25,15 @@ class BSBIIndex:
     index_name(str): Nama dari file yang berisi inverted index
     """
 
-    def __init__(self, data_dir, output_dir, postings_encoding, index_name="main_index"):
+    def __init__(self, data_dir, output_dir, postings_encoding, index_name="main_index", wand_config={"use_wand": False, "scoring_function": "bm25"}):
         self.term_id_map = IdMap()
         self.doc_id_map = IdMap()
         self.data_dir = data_dir
         self.output_dir = output_dir
         self.index_name = index_name
+        self.use_wand = wand_config.get("use_wand", False)
+        self.scoring_function = wand_config.get("scoring_function", "bm25")
+
         self.postings_encoding = postings_encoding
 
         # Untuk menyimpan nama-nama file dari semua intermediate inverted index
@@ -128,10 +131,22 @@ class BSBIIndex:
             if doc_id not in term_tf[term_id]:
                 term_tf[term_id][doc_id] = 0
             term_tf[term_id][doc_id] += 1
+        N = len(set(doc_id for _, doc_id in td_pairs))
         for term_id in sorted(term_dict.keys()):
             sorted_doc_id = sorted(list(term_dict[term_id]))
             assoc_tf = [term_tf[term_id][doc_id] for doc_id in sorted_doc_id]
-            index.append(term_id, sorted_doc_id, assoc_tf)
+
+            df = len(sorted_doc_id)
+            if self.use_wand:
+                if self.scoring_function == "tfidf":
+                    max_impact = compute_max_impact_tfidf(
+                        assoc_tf, df, N)
+                else:
+                    max_impact = compute_max_impact_bm25(
+                        assoc_tf, df, N)
+                index.append(term_id, sorted_doc_id, assoc_tf, max_impact)
+            else:
+                index.append(term_id, sorted_doc_id, assoc_tf)
 
     def merge(self, indices, merged_index):
         """
@@ -289,6 +304,127 @@ class BSBIIndex:
                     for (doc_id, score) in scores.items()]
             return sorted(docs, key=lambda x: x[0], reverse=True)[:k]
 
+    def retrieve_wand_optimized(self, query, k=10, scoring='tfidf', k1=1.5, b=0.75):
+        """
+        Optimized WAND with pivot selection and early termination.
+        Follows the classic WAND algorithm structure.
+        """
+        if len(self.term_id_map) == 0 or len(self.doc_id_map) == 0:
+            self.load()
+
+        query_terms = [self.term_id_map[word]
+                       for word in query.split() if word in self.term_id_map.str_to_id]
+        if not query_terms:
+            return []
+
+        with InvertedIndexReader(self.index_name, self.postings_encoding, directory=self.output_dir) as merged_index:
+            N = len(merged_index.doc_length)
+            if N == 0:
+                return []
+            avgdl = sum(merged_index.doc_length.values()) / \
+                N if scoring == 'bm25' else 0
+
+            # Pre-load term data
+            term_data = []
+            for term_id in query_terms:
+                if term_id not in merged_index.postings_dict:
+                    continue
+                meta = merged_index.postings_dict[term_id]
+                df = meta[1]
+                postings, tf_list = merged_index.get_postings_list(term_id)
+                if len(meta) >= 5:
+                    upper_bound = meta[4]
+                else:
+                    # Compute bound using the SAME scoring function
+                    if scoring == 'tfidf':
+                        upper_bound = compute_max_impact_tfidf(tf_list, df, N)
+                    else:  # bm25
+                        upper_bound = compute_max_impact_bm25(
+                            tf_list, df, N, k1=k1, b=b)
+
+                # Pre-compute IDF
+                idf = math.log(N / df) if df > 0 else 0.0
+
+                term_data.append({
+                    'term_id': term_id,
+                    'postings': postings,
+                    'tf_list': tf_list,
+                    'upper_bound': upper_bound,
+                    'idf': idf,
+                    'pointer': 0
+                })
+
+            if not term_data:
+                return []
+
+            # Sort by upper bound descending
+            term_data.sort(key=lambda x: x['upper_bound'], reverse=True)
+
+            # Min-heap for top-K: (score, doc_id)
+            top_k = []
+            threshold = 0.0
+
+            # Pre-compute doc_length lookup
+            doc_len = merged_index.doc_length
+
+            # WAND main loop with pivot
+            while True:
+                # Find the term with smallest current docID
+                active = [(td['postings'][td['pointer']], td)
+                          for td in term_data if td['pointer'] < len(td['postings'])]
+                if not active:
+                    break
+
+                # Sort active terms by current docID
+                active.sort(key=lambda x: x[0])
+                current_doc = active[0][0]
+
+                # PIVOT SELECTION: find minimal prefix of terms whose bounds sum >= threshold
+                cumulative = 0.0
+                pivot_idx = -1
+                for i, (doc_id, td) in enumerate(active):
+                    if doc_id == current_doc:
+                        cumulative += td['upper_bound']
+                        if cumulative >= threshold:
+                            pivot_idx = i
+                            break
+
+                if pivot_idx == -1:
+                    # Cannot reach threshold: skip to next smallest docID
+                    next_doc = active[-1][0]  # largest current docID
+                    for td in term_data:
+                        while td['pointer'] < len(td['postings']) and td['postings'][td['pointer']] <= next_doc:
+                            td['pointer'] += 1
+                    continue
+
+                # Evaluate candidate document (current_doc)
+                score = 0.0
+                dl = doc_len.get(current_doc, 0)
+                for doc_id, td in active:
+                    if doc_id == current_doc:
+                        tf = td['tf_list'][td['pointer']]
+                        score += compute_single_term_score(
+                            tf, td['idf'], dl, avgdl, scoring, k1, b)
+
+                # Update top-K
+                if len(top_k) < k:
+                    heapq.heappush(top_k, (score, current_doc))
+                    if len(top_k) == k:
+                        threshold = top_k[0][0]
+                elif score > threshold:
+                    heapq.heapreplace(top_k, (score, current_doc))
+                    threshold = top_k[0][0]
+
+                # Advance all pointers at current_doc
+                for td in term_data:
+                    if td['pointer'] < len(td['postings']) and td['postings'][td['pointer']] == current_doc:
+                        td['pointer'] += 1
+
+            # Return formatted results
+            results = [(score, self.doc_id_map[doc_id])
+                       for score, doc_id in sorted(top_k, reverse=True)]
+            return results
+
     def index(self):
         """
         Base indexing code
@@ -321,5 +457,5 @@ if __name__ == "__main__":
 
     BSBI_instance = BSBIIndex(data_dir='collection',
                               postings_encoding=EliasGammaPostings,
-                              output_dir='index')
+                              output_dir='index', wand_config={"use_wand": True, "scoring_function": "bm25"})
     BSBI_instance.index()  # memulai indexing!

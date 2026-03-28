@@ -1,3 +1,6 @@
+import math
+
+
 class IdMap:
     """
     Ingat kembali di kuliah, bahwa secara praktis, sebuah dokumen dan
@@ -63,6 +66,7 @@ class IdMap:
         else:
             raise TypeError
 
+
 def sorted_merge_posts_and_tfs(posts_tfs1, posts_tfs2):
     """
     Menggabung (merge) dua lists of tuples (doc id, tf) dan mengembalikan
@@ -108,15 +112,58 @@ def sorted_merge_posts_and_tfs(posts_tfs1, posts_tfs2):
         j += 1
     return merge
 
+
+def compute_max_impact_tfidf(tf_list, df, N):
+    """
+    Compute maximum possible impact score for a term under TF-IDF.
+    w(t,D) = (1 + log tf) if tf > 0, else 0
+    w(t,Q) = IDF = log(N / df)
+    Max impact = IDF * (1 + log(max_tf))
+    """
+    if not tf_list:
+        return 0.0
+    max_tf = max(tf_list)
+    idf = math.log(N / df) if df > 0 else 0.0
+    return idf * (1 + math.log(max_tf)) if max_tf > 0 else 0.0
+
+
+def compute_max_impact_bm25(tf_list, df, N, k1=1.5, b=0.75):
+    """
+    Compute approximate upper bound for BM25.
+    BM25 term score = IDF * ((tf * (k1+1)) / (tf + k1 * (1 - b + b * dl/avgdl)))
+
+    Upper bound approximation: assume dl is minimal (best case for score)
+    We use: max_score ≈ IDF * (k1 + 1)  [when tf → ∞ and dl → 0]
+    """
+    if not tf_list or df == 0:
+        return 0.0
+    idf = math.log(N / df) if df > 0 else 0.0
+    # Conservative upper bound: (k1+1) is the max multiplier for IDF
+    return idf * (k1 + 1)
+
+
+def compute_single_term_score(tf, idf, dl, avgdl, scoring, k1, b):
+    if scoring == 'tfidf':
+        return idf * (1 + math.log(tf)) if tf > 0 else 0.0
+    else:  # bm25
+        if tf == 0 or dl == 0:
+            return 0.0
+        num = tf * (k1 + 1)
+        den = tf + k1 * (1 - b + b * (dl / avgdl))
+    return idf * (num / den)
+
+
 def test(output, expected):
     """ simple function for testing """
     return "PASSED" if output == expected else "FAILED"
+
 
 if __name__ == '__main__':
 
     doc = ["halo", "semua", "selamat", "pagi", "semua"]
     term_id_map = IdMap()
-    assert [term_id_map[term] for term in doc] == [0, 1, 2, 3, 1], "term_id salah"
+    assert [term_id_map[term]
+            for term in doc] == [0, 1, 2, 3, 1], "term_id salah"
     assert term_id_map[1] == "semua", "term_id salah"
     assert term_id_map[0] == "halo", "term_id salah"
     assert term_id_map["selamat"] == 2, "term_id salah"
@@ -126,7 +173,8 @@ if __name__ == '__main__':
             "/collection/0/data10.txt",
             "/collection/1/data53.txt"]
     doc_id_map = IdMap()
-    assert [doc_id_map[docname] for docname in docs] == [0, 1, 2], "docs_id salah"
+    assert [doc_id_map[docname]
+            for docname in docs] == [0, 1, 2], "docs_id salah"
 
-    assert sorted_merge_posts_and_tfs([(1, 34), (3, 2), (4, 23)], \
-                                      [(1, 11), (2, 4), (4, 3 ), (6, 13)]) == [(1, 45), (2, 4), (3, 2), (4, 26), (6, 13)], "sorted_merge_posts_and_tfs salah"
+    assert sorted_merge_posts_and_tfs([(1, 34), (3, 2), (4, 23)],
+                                      [(1, 11), (2, 4), (4, 3), (6, 13)]) == [(1, 45), (2, 4), (3, 2), (4, 26), (6, 13)], "sorted_merge_posts_and_tfs salah"
